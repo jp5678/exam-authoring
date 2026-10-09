@@ -1225,33 +1225,39 @@ $('btnGenerate').addEventListener('click', async ()=>{
 /* Anthropic tool use로 강제 호출 — 모델이 자유 텍스트로 JSON을 "쓰는" 대신
    API가 직접 구조화된 객체를 채워 돌려주므로, 지문 속 따옴표 때문에 JSON이
    깨지는 문제(예: "Expected ',' or ']' ..." 파싱 오류)가 원천적으로 생기지 않는다. */
-const EXAM_TOOL = {
-  name:'submit_exam',
-  description:'출제한 시험 문항 목록을 제출한다.',
-  input_schema:{
-    type:'object',
-    properties:{
-      questions:{
-        type:'array',
-        items:{
-          type:'object',
-          properties:{
-            type:{ type:'string', enum:['mcq','tf','short','essay'] },
-            difficulty:{ type:'string', enum:['상','중','하'] },
-            question:{ type:'string', description:'문제 지문 또는 진술문' },
-            choices:{ type:'array', items:{ type:'string' }, minItems:5, maxItems:5, description:'mcq 전용. 보기 5개' },
-            answer:{ description:'mcq: 정답 보기 번호(1~5, number). tf: true(참)/false(거짓). short: 정답 문자열.' },
-            explanation:{ type:'string', description:'mcq·tf·short 전용 해설' },
-            modelAnswer:{ type:'string', description:'essay 전용 모범답안' },
-            rubric:{ type:'array', items:{ type:'string' }, description:'essay 전용 항목별 채점기준(배점 포함)' }
-          },
-          required:['type','difficulty','question']
+/* questions 배열 길이를 요청한 총 문항 수로 못박아, 모델이 빈 배열이나
+   일부만 채운 호출로 끝내는 것을 스키마 차원에서 막는다. */
+function buildExamTool(total){
+  return {
+    name:'submit_exam',
+    description:'출제한 시험 문항 목록을 제출한다. questions 배열에는 빠짐없이 정확히 ' + total + '개의 문항을 포함해야 한다.',
+    input_schema:{
+      type:'object',
+      properties:{
+        questions:{
+          type:'array',
+          minItems:total,
+          maxItems:total,
+          items:{
+            type:'object',
+            properties:{
+              type:{ type:'string', enum:['mcq','tf','short','essay'] },
+              difficulty:{ type:'string', enum:['상','중','하'] },
+              question:{ type:'string', description:'문제 지문 또는 진술문' },
+              choices:{ type:'array', items:{ type:'string' }, minItems:5, maxItems:5, description:'mcq 전용. 보기 5개' },
+              answer:{ description:'mcq: 정답 보기 번호(1~5, number). tf: true(참)/false(거짓). short: 정답 문자열.' },
+              explanation:{ type:'string', description:'mcq·tf·short 전용 해설' },
+              modelAnswer:{ type:'string', description:'essay 전용 모범답안' },
+              rubric:{ type:'array', items:{ type:'string' }, description:'essay 전용 항목별 채점기준(배점 포함)' }
+            },
+            required:['type','difficulty','question']
+          }
         }
-      }
-    },
-    required:['questions']
-  }
-};
+      },
+      required:['questions']
+    }
+  };
+}
 /* 요청 문항 수가 많을수록(특히 서술형) 응답이 길어져 max_tokens를 넘기면
    중간에 잘려 파싱이 실패하므로, 문항 수에 비례해 상한을 넉넉히 늘린다. */
 function estimateMaxTokens(counts){
@@ -1281,6 +1287,38 @@ function stopProgress(done){
   }
 }
 
+async function callExamApi(s, key, extraNote){
+  const total = s.counts.mcq + s.counts.tf + s.counts.short + s.counts.essay;
+  const res = await fetch('https://api.anthropic.com/v1/messages', {
+    method:'POST',
+    headers:{
+      'content-type':'application/json',
+      'x-api-key':key,
+      'anthropic-version':'2023-06-01',
+      'anthropic-dangerous-direct-browser-access':'true'
+    },
+    body:JSON.stringify({
+      model:API_MODEL,
+      max_tokens:estimateMaxTokens(s.counts),
+      tools:[buildExamTool(total)],
+      tool_choice:{ type:'tool', name:'submit_exam' },
+      messages:[{ role:'user', content:buildPrompt(s) + (extraNote || '') }]
+    })
+  });
+  if(!res.ok){
+    const detail = await res.text().catch(()=> '');
+    if(res.status === 401) throw new Error('API 키가 올바르지 않습니다. 키를 확인해주세요.');
+    if(res.status === 429) throw new Error('요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.');
+    throw new Error('API 호출 실패 (HTTP ' + res.status + ')\n' + detail.slice(0, 300));
+  }
+  const data = await res.json();
+  if(data.stop_reason === 'max_tokens')
+    throw new Error('문항 수가 많아 응답이 중간에 끊겼습니다. 문항 수를 줄여 다시 시도하세요.');
+  const toolBlock = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'submit_exam');
+  if(!toolBlock) throw new Error('모델이 올바른 형식으로 응답하지 않았습니다. 다시 시도해주세요.');
+  return toolBlock.input;
+}
+
 async function generateViaApi(s, key){
   const btn = $('btnGenerate');
   btn.disabled = true; btn.textContent = '출제 중… 잠시만 기다려주세요';
@@ -1292,34 +1330,12 @@ async function generateViaApi(s, key){
   showTab('exam');
 
   try{
-    const res = await fetch('https://api.anthropic.com/v1/messages', {
-      method:'POST',
-      headers:{
-        'content-type':'application/json',
-        'x-api-key':key,
-        'anthropic-version':'2023-06-01',
-        'anthropic-dangerous-direct-browser-access':'true'
-      },
-      body:JSON.stringify({
-        model:API_MODEL,
-        max_tokens:estimateMaxTokens(s.counts),
-        tools:[EXAM_TOOL],
-        tool_choice:{ type:'tool', name:'submit_exam' },
-        messages:[{ role:'user', content:buildPrompt(s) }]
-      })
-    });
-    if(!res.ok){
-      const detail = await res.text().catch(()=> '');
-      if(res.status === 401) throw new Error('API 키가 올바르지 않습니다. 키를 확인해주세요.');
-      if(res.status === 429) throw new Error('요청 한도를 초과했습니다. 잠시 후 다시 시도하세요.');
-      throw new Error('API 호출 실패 (HTTP ' + res.status + ')\n' + detail.slice(0, 300));
+    let raw = await callExamApi(s, key);
+    /* 모델이 빈 배열로 호출을 끝내는 드문 경우 — 한 번만 자동 재시도 */
+    if(!raw || !Array.isArray(raw.questions) || raw.questions.length === 0){
+      raw = await callExamApi(s, key, '\n\n[중요] 이전 시도에서 questions 배열이 비어 있었습니다. 반드시 모든 문항을 채워 submit_exam 도구를 다시 호출하세요.');
     }
-    const data = await res.json();
-    if(data.stop_reason === 'max_tokens')
-      throw new Error('문항 수가 많아 응답이 중간에 끊겼습니다. 문항 수를 줄여 다시 시도하세요.');
-    const toolBlock = (data.content || []).find(b => b.type === 'tool_use' && b.name === 'submit_exam');
-    if(!toolBlock) throw new Error('모델이 올바른 형식으로 응답하지 않았습니다. 다시 시도해주세요.');
-    applyExam(s, normalizeQuestions(toolBlock.input, s));
+    applyExam(s, normalizeQuestions(raw, s));
     stopProgress(true);
     toast('출제 완료 — 문항을 클릭하면 수정할 수 있습니다');
   }catch(e){
